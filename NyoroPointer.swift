@@ -1,3 +1,7 @@
+// Copyright 2026 tahoooo0oo
+// SPDX-License-Identifier: Apache-2.0
+// See LICENSE and NOTICE for license terms and third-party attribution.
+
 import AppKit
 import CoreGraphics
 import Carbon
@@ -103,6 +107,11 @@ final class OverlayWindow: NSWindow {
     override var canBecomeMain: Bool { false }
 }
 
+// Background cursor-control technique based on CursorHide's propStringHack:
+// Copyright 2014 Geoff Greer. Licensed under Apache-2.0; see LICENSE and NOTICE.
+// https://github.com/ggreer/CursorHide/blob/2cdeb5e4e512ee626f3b063cd9d6457521063d46/CursorHide/AppDelegate.m
+// Changes: implemented in Swift with dynamic symbol lookup, availability checks,
+// explicit experimental opt-in, and restoration of the background property.
 // CoreGraphics' public hide call is foreground-oriented. Resolve the optional
 // process-local background-cursor property only after explicit experimental opt-in.
 // Never instantiate this control on startup; never change system files.

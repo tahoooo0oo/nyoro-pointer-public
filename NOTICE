@@ -1,0 +1,19 @@
+Nyoro Pointer
+Copyright 2026 tahoooo0oo
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+The background cursor-control technique in BackgroundCursorControl in
+NyoroPointer.swift is based on the following project:
+
+CursorHide
+Copyright 2014 Geoff Greer
+
+Source: https://github.com/ggreer/CursorHide
+Reference revision: 2cdeb5e4e512ee626f3b063cd9d6457521063d46
+Reference file: CursorHide/AppDelegate.m (propStringHack)
+License: Apache License, Version 2.0
+
+Changes in Nyoro Pointer: implemented the technique in Swift with runtime
+symbol lookup, availability checks, explicit experimental opt-in, and
+restoration of the background cursor setting when disabled or terminated.
