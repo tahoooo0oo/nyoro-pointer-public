@@ -1,0 +1,423 @@
+import AppKit
+import CoreGraphics
+import Carbon
+import Darwin
+
+// Coordinates remain in AppKit's global desktop space, including negative origins.
+struct NyoroTrail {
+    var points: [CGPoint] = []
+    var count = 6
+    var diameter: CGFloat = 14
+    var spacing: CGFloat { diameter * 0.86 }
+
+    mutating func reset(at head: CGPoint) {
+        points = (0..<count).map { CGPoint(x: head.x - CGFloat($0) * spacing,
+                                          y: head.y - CGFloat($0) * spacing * 0.1) }
+    }
+
+    mutating func move(to head: CGPoint) {
+        if points.count != count || points.isEmpty {
+            reset(at: head)
+        }
+        if hypot(head.x - points[0].x, head.y - points[0].y) > 1000 {
+            reset(at: head)
+        }
+        points[0] = head
+        for i in 1..<points.count {
+            let dx = points[i].x - points[i-1].x
+            let dy = points[i].y - points[i-1].y
+            let distance = hypot(dx, dy)
+            if distance > spacing {
+                points[i] = CGPoint(x: points[i-1].x + dx / distance * spacing,
+                                    y: points[i-1].y + dy / distance * spacing)
+            }
+        }
+    }
+}
+
+func paintNyoro(points: [CGPoint], diameter: CGFloat, gaming: Bool = false, phase: CGFloat = 0) {
+    // Yellow normally; head-to-tail rainbow in gaming mode, matching the reference.
+    // The center of the first bead is the actual click location.
+    let yellowGradient = NSGradient(starting: NSColor(calibratedRed: 1, green: 0.98, blue: 0.40, alpha: 1),
+                              ending: NSColor(calibratedRed: 1, green: 0.79, blue: 0.01, alpha: 1))!
+    for index in points.indices.reversed() {
+        let point = points[index]
+        let progress = CGFloat(index) / CGFloat(max(1, points.count - 1))
+        let hue = (1.0 / 6.0 + progress * (0.88 - 1.0 / 6.0) + phase).truncatingRemainder(dividingBy: 1)
+        let gradient = gaming
+            ? NSGradient(starting: NSColor(calibratedHue: hue, saturation: 0.60, brightness: 1, alpha: 1),
+                         ending: NSColor(calibratedHue: hue, saturation: 1, brightness: 0.97, alpha: 1))!
+            : yellowGradient
+        let rect = CGRect(x: point.x - diameter / 2, y: point.y - diameter / 2,
+                          width: diameter, height: diameter)
+        let path = NSBezierPath(ovalIn: rect)
+        NSGraphicsContext.saveGraphicsState()
+        let shadow = NSShadow()
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.22)
+        shadow.shadowBlurRadius = 1.5
+        shadow.shadowOffset = NSSize(width: 0, height: -1)
+        shadow.set()
+        gradient.draw(in: path, relativeCenterPosition: NSPoint(x: -0.30, y: 0.45))
+        NSGraphicsContext.restoreGraphicsState()
+        let outline = gaming
+            ? NSColor(calibratedHue: hue, saturation: 1, brightness: 0.72, alpha: 0.65)
+            : NSColor(calibratedRed: 0.76, green: 0.58, blue: 0, alpha: 0.65)
+        outline.setStroke()
+        path.lineWidth = 0.65
+        path.stroke()
+    }
+}
+
+final class TrailView: NSView {
+    var gaming = false
+    var phase: CGFloat = 0
+    var points: [CGPoint] = []
+    var diameter: CGFloat = 14
+    override var isOpaque: Bool { false }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.clear.setFill()
+        dirtyRect.fill(using: .copy)
+        paintNyoro(points: points, diameter: diameter, gaming: gaming, phase: phase)
+    }
+
+    func update(_ globalPoints: [CGPoint], origin: CGPoint, diameter: CGFloat, gaming: Bool, phase: CGFloat) {
+        let old = drawingBounds()
+        self.points = globalPoints.map { CGPoint(x: $0.x - origin.x, y: $0.y - origin.y) }
+        self.diameter = diameter
+        self.gaming = gaming
+        self.phase = phase
+        setNeedsDisplay(old.union(drawingBounds()))
+    }
+
+    private func drawingBounds() -> CGRect {
+        guard let first = points.first else { return .zero }
+        var rect = CGRect(x: first.x, y: first.y, width: 1, height: 1)
+        for p in points { rect = rect.union(CGRect(x: p.x, y: p.y, width: 1, height: 1)) }
+        return rect.insetBy(dx: -diameter, dy: -diameter)
+    }
+}
+
+final class OverlayWindow: NSWindow {
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+// CoreGraphics' public hide call is foreground-oriented. Resolve the optional
+// process-local background-cursor property at runtime; never change system files.
+// If unavailable on a future OS, retain the system arrow as a usable fallback.
+final class BackgroundCursorControl {
+    private var handle: UnsafeMutableRawPointer?
+    private var connection: Int32 = 0
+    private var setter: (@convention(c) (Int32, Int32, CFString, CFTypeRef) -> Int32)?
+    private(set) var available = false
+
+    init() {
+        handle = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY)
+        guard let handle,
+              let connectionSymbol = dlsym(handle, "CGSMainConnectionID") ?? dlsym(handle, "_CGSDefaultConnection"),
+              let setterSymbol = dlsym(handle, "CGSSetConnectionProperty") else { return }
+        let getConnection = unsafeBitCast(connectionSymbol, to: (@convention(c) () -> Int32).self)
+        connection = getConnection()
+        setter = unsafeBitCast(setterSymbol, to: (@convention(c) (Int32, Int32, CFString, CFTypeRef) -> Int32).self)
+        available = setter?(connection, connection, "SetsCursorInBackground" as CFString, kCFBooleanTrue!) == 0
+    }
+
+    func restore() {
+        if available {
+            _ = setter?(connection, connection, "SetsCursorInBackground" as CFString, kCFBooleanFalse!)
+            available = false
+        }
+    }
+    deinit { restore(); if let handle { dlclose(handle) } }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+    private var backgroundCursor: BackgroundCursorControl?
+    private var status: NSStatusItem!
+    private var toggleItem: NSMenuItem!
+    private var windows: [OverlayWindow] = []
+    private var timer: Timer?
+    private var hotKey: EventHotKeyRef?
+    private var hotKeyHandler: EventHandlerRef?
+    private var trail = NyoroTrail()
+    private var gaming = false
+    private var gamingStartedAt = ProcessInfo.processInfo.systemUptime
+    private var enabled = true
+    private var hideArrow = true
+    private var cursorHiddenByUs = false
+    private var menuOpen = false
+    private var suspended = false
+    private var sizeItems: [NSMenuItem] = []
+    private var lengthItems: [NSMenuItem] = []
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Prevent duplicate instances from incrementing the cursor hide count twice.
+        if NSRunningApplication.runningApplications(withBundleIdentifier: "local.taho.NyoroPointer").count > 1 {
+            NSApp.terminate(nil)
+            return
+        }
+        backgroundCursor = BackgroundCursorControl()
+        hideArrow = backgroundCursor?.available == true
+        buildMenu()
+        rebuildWindows()
+        registerShortcut()
+        NotificationCenter.default.addObserver(self, selector: #selector(rebuildWindows),
+             name: NSApplication.didChangeScreenParametersNotification, object: nil)
+        let center = NSWorkspace.shared.notificationCenter
+        for event in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification,
+                      NSWorkspace.sessionDidResignActiveNotification] {
+            center.addObserver(self, selector: #selector(suspend), name: event, object: nil)
+        }
+        for event in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification,
+                      NSWorkspace.sessionDidBecomeActiveNotification] {
+            center.addObserver(self, selector: #selector(resume), name: event, object: nil)
+        }
+        timer = Timer(timeInterval: 1.0 / 60, target: self, selector: #selector(tick),
+                      userInfo: nil, repeats: true)
+        timer?.tolerance = 0.003
+        RunLoop.main.add(timer!, forMode: .common)
+        updateVisibility()
+        tick()
+        if let index = CommandLine.arguments.firstIndex(of: "--smoke-test"), CommandLine.arguments.count > index + 1 {
+            let output = CommandLine.arguments[index + 1]
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { self.smokeTest(output: output) }
+        }
+    }
+
+    private func smokeTest(output: String) {
+        let activeScreens = NSScreen.screens.count
+        let visible = windows.allSatisfy { $0.isVisible }
+        let passThrough = windows.allSatisfy { $0.ignoresMouseEvents && !$0.canBecomeKey }
+        let cursorHideSucceeded = cursorHiddenByUs
+        toggle()
+        let hidden = windows.allSatisfy { !$0.isVisible } && !cursorHiddenByUs
+        toggle()
+        let restored = windows.allSatisfy { $0.isVisible }
+        let report: [String: Any] = [
+            "screenCount": activeScreens, "windowCount": windows.count,
+            "visible": visible, "clickThrough": passThrough,
+            "cursorHideSucceeded": cursorHideSucceeded,
+            "backgroundCursorControl": backgroundCursor?.available == true,
+            "disabledRestoresCursor": hidden, "reenabled": restored,
+            "globalShortcutRegistered": hotKey != nil,
+            "pointCount": trail.points.count,
+            "passed": activeScreens > 0 && activeScreens == windows.count && visible && passThrough && hidden && restored
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) {
+            try? data.write(to: URL(fileURLWithPath: output))
+        }
+        NSApp.terminate(nil)
+    }
+
+    private func buildMenu() {
+        status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        status.button?.title = "にょろ"
+        status.button?.toolTip = "にょろポインタ：Control＋Option＋Nで表示切替"
+        let menu = NSMenu()
+        menu.delegate = self
+        menu.autoenablesItems = false
+        let heading = NSMenuItem(title: "にょろポインタ", action: nil, keyEquivalent: "")
+        menu.addItem(heading)
+        toggleItem = item("にょろを表示", #selector(toggle), menu)
+        toggleItem.keyEquivalent = "n"
+        toggleItem.keyEquivalentModifierMask = [.control, .option]
+        let gamingItem = item("ゲーミングモード（虹色）", #selector(toggleGaming(_:)), menu)
+        gamingItem.state = gaming ? .on : .off
+        let arrow = item("普通のカーソルを隠す", #selector(toggleArrow(_:)), menu)
+        arrow.state = hideArrow ? .on : .off
+        arrow.isEnabled = backgroundCursor?.available == true
+        menu.addItem(.separator())
+        let length = NSMenuItem(title: "長さ", action: nil, keyEquivalent: "")
+        let lengthMenu = NSMenu()
+        for value in [3, 4, 6, 8, 40] {
+            let entry = item("\(value)玉", #selector(changeLength(_:)), lengthMenu)
+            entry.tag = value
+            entry.state = value == trail.count ? .on : .off
+            lengthItems.append(entry)
+        }
+        length.submenu = lengthMenu
+        menu.addItem(length)
+        let size = NSMenuItem(title: "玉の大きさ", action: nil, keyEquivalent: "")
+        let sizeMenu = NSMenu()
+        for value in [10, 14, 18, 24] {
+            let entry = item("\(value) pt", #selector(changeSize(_:)), sizeMenu)
+            entry.tag = value
+            entry.state = CGFloat(value) == trail.diameter ? .on : .off
+            sizeItems.append(entry)
+        }
+        size.submenu = sizeMenu
+        menu.addItem(size)
+        menu.addItem(.separator())
+        item("終了（普通のカーソルに戻す）", #selector(quit), menu)
+        status.menu = menu
+    }
+
+    @discardableResult private func item(_ title: String, _ action: Selector, _ menu: NSMenu) -> NSMenuItem {
+        let entry = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        entry.target = self
+        menu.addItem(entry)
+        return entry
+    }
+
+    private func registerShortcut() {
+        var event = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+            DispatchQueue.main.async {
+                (NSApp.delegate as? AppDelegate)?.toggle()
+            }
+            return noErr
+        }, 1, &event, nil, &hotKeyHandler)
+        let id = EventHotKeyID(signature: OSType(0x4e59524f), id: 1)
+        let result = RegisterEventHotKey(UInt32(kVK_ANSI_N), UInt32(controlKey | optionKey), id,
+                                        GetApplicationEventTarget(), 0, &hotKey)
+        if result != noErr {
+            toggleItem.keyEquivalent = ""
+            status.button?.toolTip = "にょろポインタ：メニューから表示切替（ショートカットは使用中）"
+        }
+    }
+
+    @objc private func rebuildWindows() {
+        for window in windows { window.orderOut(nil) }
+        windows.removeAll()
+        for screen in NSScreen.screens {
+            let window = OverlayWindow(contentRect: screen.frame, styleMask: .borderless,
+                                       backing: .buffered, defer: false)
+            window.setFrame(screen.frame, display: false)
+            window.isReleasedWhenClosed = false
+            window.backgroundColor = .clear
+            window.isOpaque = false
+            window.hasShadow = false
+            window.ignoresMouseEvents = true
+            window.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
+            window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+            if #available(macOS 13.0, *) { window.collectionBehavior.insert(.canJoinAllApplications) }
+            window.hidesOnDeactivate = false
+            window.contentView = TrailView(frame: CGRect(origin: .zero, size: screen.frame.size))
+            windows.append(window)
+        }
+        trail.reset(at: NSEvent.mouseLocation)
+        updateVisibility()
+        tick()
+    }
+
+    @objc private func tick() {
+        guard enabled && !suspended && !menuOpen else { return }
+        trail.move(to: NSEvent.mouseLocation)
+        let phase = CGFloat((ProcessInfo.processInfo.systemUptime - gamingStartedAt)
+            .truncatingRemainder(dividingBy: 4.0) / 4.0)
+        for window in windows {
+            (window.contentView as? TrailView)?.update(trail.points, origin: window.frame.origin,
+                                                      diameter: trail.diameter, gaming: gaming, phase: phase)
+        }
+    }
+
+    @objc func toggle() {
+        enabled.toggle()
+        trail.reset(at: NSEvent.mouseLocation)
+        updateVisibility()
+    }
+    @objc private func toggleGaming(_ sender: NSMenuItem) {
+        gaming.toggle()
+        if gaming { gamingStartedAt = ProcessInfo.processInfo.systemUptime }
+        sender.state = gaming ? .on : .off
+        tick()
+    }
+    @objc private func toggleArrow(_ sender: NSMenuItem) {
+        hideArrow.toggle()
+        sender.state = hideArrow ? .on : .off
+        updateVisibility()
+    }
+    @objc private func changeLength(_ sender: NSMenuItem) {
+        trail.count = sender.tag
+        trail.reset(at: NSEvent.mouseLocation)
+        for entry in lengthItems { entry.state = entry === sender ? .on : .off }
+    }
+    @objc private func changeSize(_ sender: NSMenuItem) {
+        trail.diameter = CGFloat(sender.tag)
+        trail.reset(at: NSEvent.mouseLocation)
+        for entry in sizeItems { entry.state = entry === sender ? .on : .off }
+    }
+    @objc private func suspend() { suspended = true; updateVisibility() }
+    @objc private func resume() { suspended = false; trail.reset(at: NSEvent.mouseLocation); updateVisibility() }
+    @objc private func quit() { NSApp.terminate(nil) }
+
+    func menuWillOpen(_ menu: NSMenu) { menuOpen = true; updateVisibility() }
+    func menuDidClose(_ menu: NSMenu) { menuOpen = false; trail.reset(at: NSEvent.mouseLocation); updateVisibility() }
+
+    private func updateVisibility() {
+        let show = enabled && !suspended && !menuOpen
+        // Order windows in before hiding the real pointer, so there is always a pointer.
+        for window in windows {
+            if show { window.orderFrontRegardless() } else { window.orderOut(nil) }
+        }
+        toggleItem?.state = enabled ? .on : .off
+        if show && hideArrow && !cursorHiddenByUs {
+            cursorHiddenByUs = CGDisplayHideCursor(CGMainDisplayID()) == .success
+        } else if (!show || !hideArrow) && cursorHiddenByUs {
+            CGDisplayShowCursor(CGMainDisplayID())
+            cursorHiddenByUs = false
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        timer?.invalidate()
+        if cursorHiddenByUs { CGDisplayShowCursor(CGMainDisplayID()); cursorHiddenByUs = false }
+        backgroundCursor?.restore()
+        if let hotKey { UnregisterEventHotKey(hotKey) }
+        if let hotKeyHandler { RemoveEventHandler(hotKeyHandler) }
+        for window in windows { window.orderOut(nil) }
+    }
+}
+
+func selfTest() {
+    for count in [3, 4, 6, 8, 40] {
+        for diameter: CGFloat in [10, 14, 18, 24] {
+            var trail = NyoroTrail(count: count, diameter: diameter)
+            for t in 0..<1000 {
+                let head = CGPoint(x: Double(t) * 0.4 - 300, y: sin(Double(t) / 80) * 150)
+                trail.move(to: head)
+                precondition(trail.points.count == count)
+                precondition(trail.points[0] == head)
+                for i in 1..<count {
+                    precondition(trail.points[i].x.isFinite && trail.points[i].y.isFinite)
+                    precondition(hypot(trail.points[i].x - trail.points[i-1].x,
+                                       trail.points[i].y - trail.points[i-1].y) <= trail.spacing + 0.001)
+                }
+            }
+            trail.move(to: CGPoint(x: 3000, y: -500))
+            precondition(trail.points[0] == CGPoint(x: 3000, y: -500))
+        }
+    }
+    print("PASS: head location, 20 size/length combinations, finite coordinates, segment spacing, screen jumps")
+}
+
+if CommandLine.arguments.contains("--self-test") {
+    selfTest()
+} else if let index = CommandLine.arguments.firstIndex(of: "--preview"), CommandLine.arguments.count > index + 1 {
+    let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 640, pixelsHigh: 240,
+                                 bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                 isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
+    NSColor(calibratedRed: 0.13, green: 0.62, blue: 0.96, alpha: 1).setFill()
+    CGRect(x: 0, y: 0, width: 640, height: 240).fill()
+    let longPreview = CommandLine.arguments.contains("--long")
+    var trail = NyoroTrail(count: longPreview ? 40 : 6, diameter: longPreview ? 14 : 28)
+    for t in 0..<160 {
+        let v = Double(t) / 159
+        trail.move(to: CGPoint(x: (longPreview ? 30 : 210) + v * (longPreview ? 570 : 190), y: 60 + v * v * 110))
+    }
+    let phaseIndex = CommandLine.arguments.firstIndex(of: "--phase")
+    let phase = phaseIndex.flatMap { $0 + 1 < CommandLine.arguments.count ? Double(CommandLine.arguments[$0 + 1]) : nil } ?? 0
+    paintNyoro(points: trail.points, diameter: trail.diameter,
+               gaming: CommandLine.arguments.contains("--gaming"), phase: CGFloat(phase))
+    NSGraphicsContext.restoreGraphicsState()
+    try bitmap.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: CommandLine.arguments[index + 1]))
+} else {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    let delegate = AppDelegate()
+    app.delegate = delegate
+    app.run()
+}
