@@ -104,7 +104,8 @@ final class OverlayWindow: NSWindow {
 }
 
 // CoreGraphics' public hide call is foreground-oriented. Resolve the optional
-// process-local background-cursor property at runtime; never change system files.
+// process-local background-cursor property only after explicit experimental opt-in.
+// Never instantiate this control on startup; never change system files.
 // If unavailable on a future OS, retain the system arrow as a usable fallback.
 final class BackgroundCursorControl {
     private var handle: UnsafeMutableRawPointer?
@@ -144,7 +145,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var gaming = false
     private var gamingStartedAt = ProcessInfo.processInfo.systemUptime
     private var enabled = true
-    private var hideArrow = true
+    private var hideArrow = false
+    private var confirmingExperimental = false
     private var cursorHiddenByUs = false
     private var menuOpen = false
     private var suspended = false
@@ -157,8 +159,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             NSApp.terminate(nil)
             return
         }
-        backgroundCursor = BackgroundCursorControl()
-        hideArrow = backgroundCursor?.available == true
         buildMenu()
         rebuildWindows()
         registerShortcut()
@@ -189,20 +189,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let activeScreens = NSScreen.screens.count
         let visible = windows.allSatisfy { $0.isVisible }
         let passThrough = windows.allSatisfy { $0.ignoresMouseEvents && !$0.canBecomeKey }
-        let cursorHideSucceeded = cursorHiddenByUs
+        let standardMode = backgroundCursor == nil && !hideArrow && !cursorHiddenByUs
         toggle()
         let hidden = windows.allSatisfy { !$0.isVisible } && !cursorHiddenByUs
         toggle()
         let restored = windows.allSatisfy { $0.isVisible }
+        let remainsStandard = backgroundCursor == nil && !hideArrow && !cursorHiddenByUs
         let report: [String: Any] = [
             "screenCount": activeScreens, "windowCount": windows.count,
             "visible": visible, "clickThrough": passThrough,
-            "cursorHideSucceeded": cursorHideSucceeded,
+            "standardModeWithoutPrivateControl": standardMode,
+            "stillStandardAfterToggle": remainsStandard,
             "backgroundCursorControl": backgroundCursor?.available == true,
             "disabledRestoresCursor": hidden, "reenabled": restored,
             "globalShortcutRegistered": hotKey != nil,
             "pointCount": trail.points.count,
-            "passed": activeScreens > 0 && activeScreens == windows.count && visible && passThrough && hidden && restored
+            "passed": activeScreens > 0 && activeScreens == windows.count && visible && passThrough && hidden && restored && standardMode && remainsStandard && hotKey != nil
         ]
         if let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) {
             try? data.write(to: URL(fileURLWithPath: output))
@@ -224,9 +226,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         toggleItem.keyEquivalentModifierMask = [.control, .option]
         let gamingItem = item("ゲーミングモード（虹色）", #selector(toggleGaming(_:)), menu)
         gamingItem.state = gaming ? .on : .off
-        let arrow = item("普通のカーソルを隠す", #selector(toggleArrow(_:)), menu)
+        let arrow = item("普通の矢印を隠す（実験機能）", #selector(toggleArrow(_:)), menu)
         arrow.state = hideArrow ? .on : .off
-        arrow.isEnabled = backgroundCursor?.available == true
         menu.addItem(.separator())
         let length = NSMenuItem(title: "長さ", action: nil, keyEquivalent: "")
         let lengthMenu = NSMenu()
@@ -302,7 +303,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func tick() {
-        guard enabled && !suspended && !menuOpen else { return }
+        guard enabled && !suspended && !menuOpen && !confirmingExperimental else { return }
         trail.move(to: NSEvent.mouseLocation)
         let phase = CGFloat((ProcessInfo.processInfo.systemUptime - gamingStartedAt)
             .truncatingRemainder(dividingBy: 4.0) / 4.0)
@@ -324,9 +325,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         tick()
     }
     @objc private func toggleArrow(_ sender: NSMenuItem) {
-        hideArrow.toggle()
-        sender.state = hideArrow ? .on : .off
+        if hideArrow {
+            // Balance our public hide call before releasing the background property.
+            hideArrow = false
+            updateVisibility()
+            backgroundCursor?.restore()
+            backgroundCursor = nil
+            sender.state = .off
+            return
+        }
+        guard !confirmingExperimental else { return }
+        confirmingExperimental = true
         updateVisibility()
+        defer {
+            confirmingExperimental = false
+            sender.state = hideArrow ? .on : .off
+            trail.reset(at: NSEvent.mouseLocation)
+            updateVisibility()
+        }
+        let alert = NSAlert()
+        alert.messageText = "普通の矢印を隠す実験機能を有効にしますか？"
+        alert.informativeText = "他のアプリを操作中も矢印を隠すため、macOSの非公開APIを呼び出します。OS更新などで動作しなくなったり、カーソル表示の不具合やアプリの異常終了が起きる可能性があります。\n\n標準モードではこのAPIを呼ばず、普通の矢印とにょろを一緒に表示します。この機能はメニューでオフにでき、次回起動時もオフに戻ります。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "実験機能を有効にする")
+        alert.addButton(withTitle: "キャンセル")
+        // Return/Escape should leave the safer default unchanged.
+        alert.buttons[0].keyEquivalent = ""
+        alert.buttons[1].keyEquivalent = "\r"
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        // This is the only creation site: cancellation and ordinary startup never
+        // resolve or invoke the private symbols.
+        let control = BackgroundCursorControl()
+        guard control.available else {
+            let failure = NSAlert()
+            failure.messageText = "このMacでは実験機能を有効にできませんでした"
+            failure.informativeText = "普通の矢印とにょろを表示する標準モードで続けます。"
+            failure.runModal()
+            return
+        }
+        backgroundCursor = control
+        hideArrow = true
     }
     @objc private func changeLength(_ sender: NSMenuItem) {
         trail.count = sender.tag
@@ -346,7 +386,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuDidClose(_ menu: NSMenu) { menuOpen = false; trail.reset(at: NSEvent.mouseLocation); updateVisibility() }
 
     private func updateVisibility() {
-        let show = enabled && !suspended && !menuOpen
+        let show = enabled && !suspended && !menuOpen && !confirmingExperimental
         // Order windows in before hiding the real pointer, so there is always a pointer.
         for window in windows {
             if show { window.orderFrontRegardless() } else { window.orderOut(nil) }
