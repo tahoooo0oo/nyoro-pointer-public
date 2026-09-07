@@ -102,7 +102,9 @@ final class TrailView: NSView {
     }
 }
 
-final class OverlayWindow: NSWindow {
+// A nonactivating panel can accompany another application's full-screen window
+// without taking focus from its browser/PDF content.
+final class OverlayWindow: NSPanel {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 }
@@ -174,6 +176,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NotificationCenter.default.addObserver(self, selector: #selector(rebuildWindows),
              name: NSApplication.didChangeScreenParametersNotification, object: nil)
         let center = NSWorkspace.shared.notificationCenter
+        for event in [NSWorkspace.activeSpaceDidChangeNotification,
+                      NSWorkspace.didActivateApplicationNotification] {
+            center.addObserver(self, selector: #selector(refreshOverlay), name: event, object: nil)
+        }
+        NotificationCenter.default.addObserver(self, selector: #selector(updateCursorVisibility),
+             name: NSWindow.didChangeOcclusionStateNotification, object: nil)
         for event in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification,
                       NSWorkspace.sessionDidResignActiveNotification] {
             center.addObserver(self, selector: #selector(suspend), name: event, object: nil)
@@ -198,22 +206,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let activeScreens = NSScreen.screens.count
         let visible = windows.allSatisfy { $0.isVisible }
         let passThrough = windows.allSatisfy { $0.ignoresMouseEvents && !$0.canBecomeKey }
+        let onActiveSpace = windows.allSatisfy { $0.isOnActiveSpace }
+        let overlayAtPointer = hasVisibleOverlay(at: NSEvent.mouseLocation)
+        let nonactivating = windows.allSatisfy {
+            $0.styleMask.contains(.nonactivatingPanel) && !$0.canBecomeMain && !$0.hidesOnDeactivate
+        }
         let standardMode = backgroundCursor == nil && !hideArrow && !cursorHiddenByUs
         toggle()
-        let hidden = windows.allSatisfy { !$0.isVisible } && !cursorHiddenByUs
+        let hidden = windows.allSatisfy { !$0.isVisible } && !cursorHiddenByUs &&
+            !hasVisibleOverlay(at: NSEvent.mouseLocation)
         toggle()
         let restored = windows.allSatisfy { $0.isVisible }
         let remainsStandard = backgroundCursor == nil && !hideArrow && !cursorHiddenByUs
         let report: [String: Any] = [
             "screenCount": activeScreens, "windowCount": windows.count,
             "visible": visible, "clickThrough": passThrough,
+            "onActiveSpace": onActiveSpace, "visibleOverlayAtPointer": overlayAtPointer,
+            "nonactivatingPanels": nonactivating,
             "standardModeWithoutPrivateControl": standardMode,
             "stillStandardAfterToggle": remainsStandard,
             "backgroundCursorControl": backgroundCursor?.available == true,
             "disabledRestoresCursor": hidden, "reenabled": restored,
             "globalShortcutRegistered": hotKey != nil,
             "pointCount": trail.points.count,
-            "passed": activeScreens > 0 && activeScreens == windows.count && visible && passThrough && hidden && restored && standardMode && remainsStandard && hotKey != nil
+            "passed": activeScreens > 0 && activeScreens == windows.count && visible && passThrough && onActiveSpace && overlayAtPointer && nonactivating && hidden && restored && standardMode && remainsStandard && hotKey != nil
         ]
         if let data = try? JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys]) {
             try? data.write(to: URL(fileURLWithPath: output))
@@ -291,7 +307,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for window in windows { window.orderOut(nil) }
         windows.removeAll()
         for screen in NSScreen.screens {
-            let window = OverlayWindow(contentRect: screen.frame, styleMask: .borderless,
+            let window = OverlayWindow(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel],
                                        backing: .buffered, defer: false)
             window.setFrame(screen.frame, display: false)
             window.isReleasedWhenClosed = false
@@ -300,13 +316,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             window.hasShadow = false
             window.ignoresMouseEvents = true
             window.level = NSWindow.Level(rawValue: NSWindow.Level.screenSaver.rawValue + 1)
-            window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+            window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
             if #available(macOS 13.0, *) { window.collectionBehavior.insert(.canJoinAllApplications) }
             window.hidesOnDeactivate = false
+            window.canHide = false
+            window.animationBehavior = .none
             window.contentView = TrailView(frame: CGRect(origin: .zero, size: screen.frame.size))
             windows.append(window)
         }
         trail.reset(at: NSEvent.mouseLocation)
+        updateVisibility()
+        tick()
+    }
+
+    @objc private func refreshOverlay() {
         updateVisibility()
         tick()
     }
@@ -320,6 +343,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             (window.contentView as? TrailView)?.update(trail.points, origin: window.frame.origin,
                                                       diameter: trail.diameter, gaming: gaming, phase: phase)
         }
+        // Space transitions can leave a window ordered in but absent from the
+        // current Space. Keep the real cursor until the overlay is visible there.
+        updateCursorVisibility()
     }
 
     @objc func toggle() {
@@ -401,9 +427,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if show { window.orderFrontRegardless() } else { window.orderOut(nil) }
         }
         toggleItem?.state = enabled ? .on : .off
-        if show && hideArrow && !cursorHiddenByUs {
+        updateCursorVisibility()
+    }
+
+    private func hasVisibleOverlay(at point: CGPoint) -> Bool {
+        windows.contains {
+            $0.frame.contains(point) && $0.isVisible && $0.isOnActiveSpace &&
+                $0.occlusionState.contains(.visible)
+        }
+    }
+
+    @objc private func updateCursorVisibility() {
+        let shouldHide = enabled && !suspended && !menuOpen && !confirmingExperimental &&
+            hideArrow && hasVisibleOverlay(at: NSEvent.mouseLocation)
+        if shouldHide && !cursorHiddenByUs {
             cursorHiddenByUs = CGDisplayHideCursor(CGMainDisplayID()) == .success
-        } else if (!show || !hideArrow) && cursorHiddenByUs {
+        } else if !shouldHide && cursorHiddenByUs {
             CGDisplayShowCursor(CGMainDisplayID())
             cursorHiddenByUs = false
         }
