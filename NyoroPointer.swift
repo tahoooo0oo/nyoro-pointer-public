@@ -10,8 +10,8 @@ import Darwin
 // Coordinates remain in AppKit's global desktop space, including negative origins.
 struct NyoroTrail {
     var points: [CGPoint] = []
-    var count = 6
-    var diameter: CGFloat = 14
+    var count = 8
+    var diameter: CGFloat = 18
     var spacing: CGFloat { diameter * 0.86 }
 
     mutating func reset(at head: CGPoint) {
@@ -76,7 +76,7 @@ final class TrailView: NSView {
     var gaming = false
     var phase: CGFloat = 0
     var points: [CGPoint] = []
-    var diameter: CGFloat = 14
+    var diameter: CGFloat = 18
     override var isOpaque: Bool { false }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
     override func draw(_ dirtyRect: NSRect) {
