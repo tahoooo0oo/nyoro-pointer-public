@@ -109,6 +109,28 @@ final class OverlayWindow: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+// Own at most one hide request. Refreshing must first release that request;
+// otherwise repeated app/window changes can accumulate an invisible cursor.
+final class CursorVisibilityControl {
+    private(set) var hiddenByUs = false
+    private let hide: () -> Bool
+    private let show: () -> Bool
+
+    init(hide: @escaping () -> Bool = { CGDisplayHideCursor(CGMainDisplayID()) == .success },
+         show: @escaping () -> Bool = { CGDisplayShowCursor(CGMainDisplayID()) == .success }) {
+        self.hide = hide
+        self.show = show
+    }
+
+    func update(shouldHide: Bool, refresh: Bool = false) {
+        if hiddenByUs && (!shouldHide || refresh) {
+            guard show() else { return }
+            hiddenByUs = false
+        }
+        if shouldHide && !hiddenByUs { hiddenByUs = hide() }
+    }
+}
+
 // Background cursor-control technique based on CursorHide's propStringHack:
 // Copyright 2014 Geoff Greer. Licensed under Apache-2.0; see LICENSE and NOTICE.
 // https://github.com/ggreer/CursorHide/blob/2cdeb5e4e512ee626f3b063cd9d6457521063d46/CursorHide/AppDelegate.m
@@ -120,6 +142,8 @@ final class OverlayWindow: NSPanel {
 // If unavailable on a future OS, retain the system arrow as a usable fallback.
 final class BackgroundCursorControl {
     private var handle: UnsafeMutableRawPointer?
+    private var visibilityHandle: UnsafeMutableRawPointer?
+    private var visibilityQuery: (@convention(c) () -> UInt32)?
     private var connection: Int32 = 0
     private var setter: (@convention(c) (Int32, Int32, CFString, CFTypeRef) -> Int32)?
     private(set) var available = false
@@ -133,6 +157,19 @@ final class BackgroundCursorControl {
         connection = getConnection()
         setter = unsafeBitCast(setterSymbol, to: (@convention(c) (Int32, Int32, CFString, CFTypeRef) -> Int32).self)
         available = setter?(connection, connection, "SetsCursorInBackground" as CFString, kCFBooleanTrue!) == 0
+        // This obsolete query is optional and resolved only in experimental mode.
+        // A foreground app can reveal the cursor while our hide request remains.
+        if available {
+            visibilityHandle = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_LAZY)
+            if let visibilityHandle, let symbol = dlsym(visibilityHandle, "CGCursorIsVisible") {
+                visibilityQuery = unsafeBitCast(symbol, to: (@convention(c) () -> UInt32).self)
+            }
+        }
+    }
+
+    var isCursorVisible: Bool? {
+        guard available, let visibilityQuery else { return nil }
+        return visibilityQuery() != 0
     }
 
     func restore() {
@@ -141,7 +178,11 @@ final class BackgroundCursorControl {
             available = false
         }
     }
-    deinit { restore(); if let handle { dlclose(handle) } }
+    deinit {
+        restore()
+        if let visibilityHandle { dlclose(visibilityHandle) }
+        if let handle { dlclose(handle) }
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -158,7 +199,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var enabled = true
     private var hideArrow = false
     private var confirmingExperimental = false
-    private var cursorHiddenByUs = false
+    private let cursorVisibility = CursorVisibilityControl()
+    private var cursorHiddenByUs: Bool { cursorVisibility.hiddenByUs }
+    private var cursorNeedsRefresh = false
+    private var cursorRefreshWorkItem: DispatchWorkItem?
     private var menuOpen = false
     private var suspended = false
     private var sizeItems: [NSMenuItem] = []
@@ -304,7 +348,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func rebuildWindows() {
-        for window in windows { window.orderOut(nil) }
+        for window in windows { window.close() }
         windows.removeAll()
         for screen in NSScreen.screens {
             let window = OverlayWindow(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel],
@@ -330,8 +374,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func refreshOverlay() {
+        cursorNeedsRefresh = true
         updateVisibility()
         tick()
+        // Foreground apps may reset their cursor after the activation notification.
+        // Also recover when the optional visibility query is unavailable.
+        cursorRefreshWorkItem?.cancel()
+        let refresh = DispatchWorkItem { [weak self] in
+            self?.cursorNeedsRefresh = true
+            self?.updateCursorVisibility()
+        }
+        cursorRefreshWorkItem = refresh
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: refresh)
     }
 
     @objc private func tick() {
@@ -350,8 +404,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func toggle() {
         enabled.toggle()
-        trail.reset(at: NSEvent.mouseLocation)
-        updateVisibility()
+        if enabled {
+            // Recreate panels in the current Space, just as on a fresh launch.
+            // A panel ordered out on another Space can retain stale placement.
+            rebuildWindows()
+        } else {
+            updateVisibility()
+        }
     }
     @objc private func toggleGaming(_ sender: NSMenuItem) {
         gaming.toggle()
@@ -440,17 +499,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func updateCursorVisibility() {
         let shouldHide = enabled && !suspended && !menuOpen && !confirmingExperimental &&
             hideArrow && hasVisibleOverlay(at: NSEvent.mouseLocation)
-        if shouldHide && !cursorHiddenByUs {
-            cursorHiddenByUs = CGDisplayHideCursor(CGMainDisplayID()) == .success
-        } else if !shouldHide && cursorHiddenByUs {
-            CGDisplayShowCursor(CGMainDisplayID())
-            cursorHiddenByUs = false
-        }
+        let refresh = shouldHide && (cursorNeedsRefresh ||
+            (cursorHiddenByUs && backgroundCursor?.isCursorVisible == true))
+        cursorVisibility.update(shouldHide: shouldHide, refresh: refresh)
+        cursorNeedsRefresh = false
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         timer?.invalidate()
-        if cursorHiddenByUs { CGDisplayShowCursor(CGMainDisplayID()); cursorHiddenByUs = false }
+        cursorRefreshWorkItem?.cancel()
+        cursorVisibility.update(shouldHide: false)
         backgroundCursor?.restore()
         if let hotKey { UnregisterEventHotKey(hotKey) }
         if let hotKeyHandler { RemoveEventHandler(hotKeyHandler) }
@@ -459,6 +517,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 }
 
 func selfTest() {
+    var hideCount = 0
+    var maximumHideCount = 0
+    var hideCalls = 0
+    var canHide = true
+    var canShow = true
+    let cursor = CursorVisibilityControl(hide: {
+        guard canHide else { return false }
+        hideCount += 1
+        hideCalls += 1
+        maximumHideCount = max(maximumHideCount, hideCount)
+        return true
+    }, show: {
+        guard canShow else { return false }
+        hideCount -= 1
+        precondition(hideCount >= 0)
+        return true
+    })
+    cursor.update(shouldHide: false)
+    precondition(hideCalls == 0)
+    cursor.update(shouldHide: true)
+    for _ in 0..<100 { cursor.update(shouldHide: true) }
+    precondition(hideCalls == 1 && hideCount == 1)
+    for _ in 0..<100 { cursor.update(shouldHide: true, refresh: true) }
+    precondition(hideCalls == 101 && hideCount == 1 && maximumHideCount == 1)
+    canShow = false
+    cursor.update(shouldHide: true, refresh: true)
+    precondition(hideCalls == 101 && cursor.hiddenByUs)
+    canShow = true
+    cursor.update(shouldHide: false)
+    precondition(hideCount == 0 && !cursor.hiddenByUs)
+    canHide = false
+    cursor.update(shouldHide: true)
+    precondition(!cursor.hiddenByUs && hideCount == 0)
+    canHide = true
+    cursor.update(shouldHide: true)
+    cursor.update(shouldHide: false, refresh: true)
+    cursor.update(shouldHide: false)
+    precondition(!cursor.hiddenByUs && hideCount == 0)
+    print("PASS: cursor refresh, balanced hide requests, repeated switches, hide/show failures, restoration")
+
     for count in [3, 4, 6, 8, 40] {
         for diameter: CGFloat in [10, 14, 18, 24] {
             var trail = NyoroTrail(count: count, diameter: diameter)
