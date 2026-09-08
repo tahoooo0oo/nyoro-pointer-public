@@ -9,6 +9,13 @@ import Darwin
 
 // Coordinates remain in AppKit's global desktop space, including negative origins.
 struct NyoroTrail {
+    static let countRange = 1...128
+    static func parseCount(_ text: String) -> Int? {
+        guard let count = Int(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+              countRange.contains(count) else { return nil }
+        return count
+    }
+
     var points: [CGPoint] = []
     var count = 6
     var diameter: CGFloat = 14
@@ -265,6 +272,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var enabled = true
     private var hideArrow = false
     private var confirmingExperimental = false
+    private var editingLength = false
     private let cursorVisibility = CursorVisibilityControl()
     private var cursorHiddenByUs: Bool { cursorVisibility.hiddenByUs }
     private var cursorNeedsRefresh = false
@@ -273,6 +281,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var suspended = false
     private var sizeItems: [NSMenuItem] = []
     private var lengthItems: [NSMenuItem] = []
+    private var customLengthItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Prevent duplicate instances from incrementing the cursor hide count twice.
@@ -372,6 +381,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             entry.state = value == trail.count ? .on : .off
             lengthItems.append(entry)
         }
+        lengthMenu.addItem(.separator())
+        customLengthItem = item("個数を入力…", #selector(enterLength), lengthMenu)
         length.submenu = lengthMenu
         menu.addItem(length)
         let size = NSMenuItem(title: "玉の大きさ", action: nil, keyEquivalent: "")
@@ -455,7 +466,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func tick() {
-        guard enabled && !suspended && !menuOpen && !confirmingExperimental else { return }
+        guard enabled && !suspended && !menuOpen && !confirmingExperimental && !editingLength else { return }
         let head = NSEvent.mouseLocation
         if trail.points.first != head || trail.points.count != trail.count {
             trail.move(to: head)
@@ -532,9 +543,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         hideArrow = true
     }
     @objc private func changeLength(_ sender: NSMenuItem) {
-        trail.count = sender.tag
+        setLength(sender.tag)
+    }
+
+    private func setLength(_ count: Int) {
+        guard NyoroTrail.countRange.contains(count) else { return }
+        trail.count = count
         trail.reset(at: NSEvent.mouseLocation)
-        for entry in lengthItems { entry.state = entry === sender ? .on : .off }
+        for entry in lengthItems { entry.state = entry.tag == count ? .on : .off }
+        let custom = !lengthItems.contains { $0.tag == count }
+        customLengthItem.state = custom ? .on : .off
+        customLengthItem.title = custom ? "個数を入力…（現在：\(count)玉）" : "個数を入力…"
+        tick()
+    }
+
+    @objc private func enterLength() {
+        guard !editingLength && !confirmingExperimental else { return }
+        let previousApp = NSWorkspace.shared.frontmostApplication
+        editingLength = true
+        updateVisibility()
+        defer {
+            editingLength = false
+            trail.reset(at: NSEvent.mouseLocation)
+            updateVisibility()
+            tick()
+            if previousApp?.processIdentifier != ProcessInfo.processInfo.processIdentifier {
+                previousApp?.activate(options: [])
+            }
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "玉の個数"
+        alert.informativeText = "1〜128の整数を入力してください。"
+        alert.addButton(withTitle: "適用")
+        alert.addButton(withTitle: "キャンセル")
+        alert.buttons[1].keyEquivalent = "\u{1b}"
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
+        input.stringValue = String(trail.count)
+        input.setAccessibilityLabel("玉の個数（1〜128）")
+        alert.accessoryView = input
+        alert.window.initialFirstResponder = input
+        alert.window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary, .canJoinAllApplications]
+        NSApp.activate(ignoringOtherApps: true)
+        input.selectText(nil)
+        while alert.runModal() == .alertFirstButtonReturn {
+            if let count = NyoroTrail.parseCount(input.stringValue) {
+                setLength(count)
+                break
+            }
+            alert.informativeText = "入力できるのは1〜128の整数です。例：12"
+            input.selectText(nil)
+        }
     }
     @objc private func changeSize(_ sender: NSMenuItem) {
         trail.diameter = CGFloat(sender.tag)
@@ -549,7 +608,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuDidClose(_ menu: NSMenu) { menuOpen = false; trail.reset(at: NSEvent.mouseLocation); updateVisibility() }
 
     private func updateVisibility() {
-        let show = enabled && !suspended && !menuOpen && !confirmingExperimental
+        let show = enabled && !suspended && !menuOpen && !confirmingExperimental && !editingLength
         // Order windows in before hiding the real pointer, so there is always a pointer.
         for window in windows {
             if show { window.orderFrontRegardless() } else { window.orderOut(nil) }
@@ -566,7 +625,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func updateCursorVisibility() {
-        let shouldHide = enabled && !suspended && !menuOpen && !confirmingExperimental &&
+        let shouldHide = enabled && !suspended && !menuOpen && !confirmingExperimental && !editingLength &&
             hideArrow && hasVisibleOverlay(at: NSEvent.mouseLocation)
         let refresh = shouldHide && (cursorNeedsRefresh ||
             (cursorHiddenByUs && backgroundCursor?.isCursorVisible == true))
@@ -651,7 +710,14 @@ func selfTest() {
     precondition(!cursor.hiddenByUs && hideCount == 0)
     print("PASS: cursor refresh, balanced hide requests, repeated switches, hide/show failures, restoration")
 
-    for count in [3, 4, 6, 8, 40] {
+    for count in NyoroTrail.countRange {
+        precondition(NyoroTrail.parseCount(String(count)) == count)
+    }
+    for text in ["", " ", "0", "129", "-1", "1.5", "6玉", "abc", "999999999999999999999999"] {
+        precondition(NyoroTrail.parseCount(text) == nil)
+    }
+    precondition(NyoroTrail.parseCount(" 128\n") == 128)
+    for count in [1, 2, 3, 4, 6, 8, 40, 64, 127, 128] {
         for diameter: CGFloat in [10, 14, 18, 24] {
             var trail = NyoroTrail(count: count, diameter: diameter)
             for t in 0..<1000 {
@@ -669,7 +735,7 @@ func selfTest() {
             precondition(trail.points[0] == CGPoint(x: 3000, y: -500))
         }
     }
-    print("PASS: head location, 20 size/length combinations, finite coordinates, segment spacing, screen jumps")
+    print("PASS: count input 1...128, head location, 40 size/length combinations, finite coordinates, segment spacing, screen jumps")
 }
 
 if CommandLine.arguments.contains("--self-test") {
