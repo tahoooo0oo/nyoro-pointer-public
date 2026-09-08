@@ -10,8 +10,8 @@ import Darwin
 // Coordinates remain in AppKit's global desktop space, including negative origins.
 struct NyoroTrail {
     var points: [CGPoint] = []
-    var count = 8
-    var diameter: CGFloat = 18
+    var count = 6
+    var diameter: CGFloat = 14
     var spacing: CGFloat { diameter * 0.86 }
 
     mutating func reset(at head: CGPoint) {
@@ -39,6 +39,11 @@ struct NyoroTrail {
     }
 }
 
+func nyoroHue(index: Int, count: Int, phase: CGFloat) -> CGFloat {
+    let progress = CGFloat(index) / CGFloat(max(1, count - 1))
+    return (1.0 / 6.0 + progress * (0.88 - 1.0 / 6.0) + phase).truncatingRemainder(dividingBy: 1)
+}
+
 func paintNyoro(points: [CGPoint], diameter: CGFloat, gaming: Bool = false, phase: CGFloat = 0) {
     // Yellow normally; head-to-tail rainbow in gaming mode, matching the reference.
     // The center of the first bead is the actual click location.
@@ -46,8 +51,7 @@ func paintNyoro(points: [CGPoint], diameter: CGFloat, gaming: Bool = false, phas
                               ending: NSColor(calibratedRed: 1, green: 0.79, blue: 0.01, alpha: 1))!
     for index in points.indices.reversed() {
         let point = points[index]
-        let progress = CGFloat(index) / CGFloat(max(1, points.count - 1))
-        let hue = (1.0 / 6.0 + progress * (0.88 - 1.0 / 6.0) + phase).truncatingRemainder(dividingBy: 1)
+        let hue = nyoroHue(index: index, count: points.count, phase: phase)
         let gradient = gaming
             ? NSGradient(starting: NSColor(calibratedHue: hue, saturation: 0.60, brightness: 1, alpha: 1),
                          ending: NSColor(calibratedHue: hue, saturation: 1, brightness: 0.97, alpha: 1))!
@@ -72,26 +76,88 @@ func paintNyoro(points: [CGPoint], diameter: CGFloat, gaming: Bool = false, phas
     }
 }
 
+// Cache only the current size and display scale. Rainbow colors use a bounded
+// palette, so animation cannot grow the cache indefinitely.
+final class BeadSpriteCache {
+    private var diameter: CGFloat = 0
+    private var scale: CGFloat = 0
+    private var sprites: [Int: NSImage] = [:]
+    private(set) var renderCount = 0
+
+    func sprite(diameter: CGFloat, scale: CGFloat, hue: CGFloat?) -> NSImage {
+        if self.diameter != diameter || self.scale != scale {
+            sprites.removeAll()
+            self.diameter = diameter
+            self.scale = scale
+        }
+        let colorIndex = hue.map { Int((($0 + 1).truncatingRemainder(dividingBy: 1) * 256).rounded()) % 256 } ?? -1
+        if let sprite = sprites[colorIndex] { return sprite }
+
+        // Include the original outline and shadow, rendered at the display's
+        // pixel density rather than enlarging a low-resolution image on Retina.
+        let pixels = Int(ceil((diameter + 8) * scale))
+        let side = CGFloat(pixels) / scale
+        let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: pixels, pixelsHigh: pixels,
+                                      bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                      isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        let context = NSGraphicsContext(bitmapImageRep: bitmap)!
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        context.cgContext.clear(CGRect(x: 0, y: 0, width: pixels, height: pixels))
+        context.cgContext.scaleBy(x: scale, y: scale)
+        paintNyoro(points: [CGPoint(x: side / 2, y: side / 2)], diameter: diameter,
+                   gaming: colorIndex >= 0, phase: CGFloat(max(0, colorIndex)) / 256 + 1 - 1.0 / 6.0)
+        NSGraphicsContext.restoreGraphicsState()
+        bitmap.size = NSSize(width: side, height: side)
+        let sprite = NSImage(size: bitmap.size)
+        sprite.addRepresentation(bitmap)
+        sprites[colorIndex] = sprite
+        renderCount += 1
+        return sprite
+    }
+}
+
 final class TrailView: NSView {
+    private let spriteCache = BeadSpriteCache()
     var gaming = false
     var phase: CGFloat = 0
     var points: [CGPoint] = []
-    var diameter: CGFloat = 18
+    var diameter: CGFloat = 14
     override var isOpaque: Bool { false }
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
     override func draw(_ dirtyRect: NSRect) {
         NSColor.clear.setFill()
         dirtyRect.fill(using: .copy)
-        paintNyoro(points: points, diameter: diameter, gaming: gaming, phase: phase)
+        let scale = window?.backingScaleFactor ?? 1
+        for index in points.indices.reversed() {
+            let sprite = spriteCache.sprite(diameter: diameter, scale: scale,
+                hue: gaming ? nyoroHue(index: index, count: points.count, phase: phase) : nil)
+            let rect = CGRect(x: points[index].x - sprite.size.width / 2,
+                              y: points[index].y - sprite.size.height / 2,
+                              width: sprite.size.width, height: sprite.size.height)
+            if rect.intersects(dirtyRect) {
+                sprite.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1)
+            }
+        }
     }
 
-    func update(_ globalPoints: [CGPoint], origin: CGPoint, diameter: CGFloat, gaming: Bool, phase: CGFloat) {
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        needsDisplay = true
+    }
+
+    @discardableResult
+    func update(_ globalPoints: [CGPoint], origin: CGPoint, diameter: CGFloat, gaming: Bool, phase: CGFloat) -> Bool {
+        let localPoints = globalPoints.map { CGPoint(x: $0.x - origin.x, y: $0.y - origin.y) }
+        guard points != localPoints || self.diameter != diameter || self.gaming != gaming ||
+              (gaming && self.phase != phase) else { return false }
         let old = drawingBounds()
-        self.points = globalPoints.map { CGPoint(x: $0.x - origin.x, y: $0.y - origin.y) }
+        self.points = localPoints
         self.diameter = diameter
         self.gaming = gaming
         self.phase = phase
         setNeedsDisplay(old.union(drawingBounds()))
+        return true
     }
 
     private func drawingBounds() -> CGRect {
@@ -390,7 +456,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func tick() {
         guard enabled && !suspended && !menuOpen && !confirmingExperimental else { return }
-        trail.move(to: NSEvent.mouseLocation)
+        let head = NSEvent.mouseLocation
+        if trail.points.first != head || trail.points.count != trail.count {
+            trail.move(to: head)
+        }
         let phase = CGFloat((ProcessInfo.processInfo.systemUptime - gamingStartedAt)
             .truncatingRemainder(dividingBy: 4.0) / 4.0)
         for window in windows {
@@ -516,7 +585,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 }
 
+func renderingSelfTest() {
+    let view = TrailView(frame: CGRect(x: 0, y: 0, width: 640, height: 240))
+    let points = [CGPoint(x: 110, y: 110), CGPoint(x: 95, y: 110)]
+    view.update(points, origin: .zero, diameter: 18, gaming: false, phase: 0)
+    for n in 1...1000 { precondition(!view.update(points, origin: .zero, diameter: 18, gaming: false, phase: CGFloat(n) / 1000)) }
+    precondition(view.update(points, origin: CGPoint(x: 1, y: 0), diameter: 18, gaming: false, phase: 0), "moving trail must repaint")
+    precondition(view.update(points, origin: CGPoint(x: 1, y: 0), diameter: 24, gaming: false, phase: 0), "size change must repaint")
+    view.update(points, origin: .zero, diameter: 18, gaming: true, phase: 0)
+    precondition(view.update(points, origin: .zero, diameter: 18, gaming: true, phase: 0.1), "stationary rainbow must still animate")
+    precondition(view.update(points, origin: .zero, diameter: 18, gaming: false, phase: 0.1), "leaving rainbow must repaint")
+    let cache = BeadSpriteCache()
+    let yellow = cache.sprite(diameter: 18, scale: 2, hue: nil)
+    for _ in 0..<1000 { precondition(cache.sprite(diameter: 18, scale: 2, hue: nil) === yellow) }
+    precondition(cache.renderCount == 1)
+    precondition((yellow.representations.first as! NSBitmapImageRep).pixelsWide == 52)
+    for n in 0..<4096 { _ = cache.sprite(diameter: 18, scale: 2, hue: CGFloat(n) / 4096) }
+    precondition(cache.renderCount == 257, "rainbow palette must be bounded")
+    _ = cache.sprite(diameter: 24, scale: 2, hue: nil)
+    precondition(cache.renderCount == 258)
+    _ = cache.sprite(diameter: 24, scale: 1, hue: nil)
+    precondition(cache.renderCount == 259)
+    print("PASS: idle drawing, movement, mode/size changes, bounded sprite cache, Retina scale")
+}
+
 func selfTest() {
+    renderingSelfTest()
     var hideCount = 0
     var maximumHideCount = 0
     var hideCalls = 0
