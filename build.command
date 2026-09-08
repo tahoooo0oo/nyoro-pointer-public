@@ -42,4 +42,11 @@ PY
 /bin/cp LICENSE NOTICE 'にょろポインタ.app/Contents/Resources/'
 /usr/bin/codesign --force --sign - 'にょろポインタ.app'
 'にょろポインタ.app/Contents/MacOS/NyoroPointer' --self-test
+# Refresh this app's Launch Services record after replacing the executable and
+# Info.plist; a stale record can make Finder fail with error -10810.
+if ! /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+  -f "$PWD/にょろポインタ.app"; then
+  print -u2 'アプリの登録情報を更新できませんでした。build.commandをもう一度実行してください。'
+  exit 1
+fi
 print 'できました：にょろポインタ.app をダブルクリックして起動してください。'

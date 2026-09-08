@@ -21,7 +21,7 @@ cd nyoro-pointer-public
 open 'にょろポインタ.app'
 ```
 
-`build.command` は、そのMacの実行環境（Apple Silicon / Intel）向けにアプリを作成し、軌跡のテストを実行します。`PASS:` と「できました」が表示されればビルド完了です。2回目からは生成された `にょろポインタ.app` をダブルクリックするだけで使えます。ソースを更新した場合は再度 `./build.command` を実行してください。
+`build.command` は、そのMacの実行環境（Apple Silicon / Intel）向けにアプリを作成し、軌跡のテストを実行します。Finderから起動できるよう、このアプリのmacOSへの登録情報も更新します。`PASS:` と「できました」が表示されればビルド完了です。2回目からは生成された `にょろポインタ.app` をダブルクリックするだけで使えます。ソースを更新した場合は再度 `./build.command` を実行してください。
 
 開発ツールの初回導入とクローンにはネット接続が必要ですが、導入後のビルドとアプリの使用に通信や追加ライブラリは不要です。開発ツールの案内は [Appleのインストール手順](https://developer.apple.com/documentation/xcode/installing-the-command-line-tools/) も参照してください。
 
